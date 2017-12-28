@@ -77,37 +77,73 @@ impl Bucket {
         })
     }
 
-    pub fn get(&self, key: &str) -> SFuture<Vec<u8>> {
+    pub fn get(&self, key: &str, creds: &AwsCredentials) -> SFuture<Vec<u8>> {
         let url = format!("{}{}", self.base_url, key);
         debug!("GET {}", url);
+
+
+        let date = time::now_utc().rfc822().to_string();
         let url2 = url.clone();
-        Box::new(self.client.get(url.parse().unwrap()).chain_err(move || {
-            format!("failed GET: {}", url)
-        }).and_then(|res| {
-            if res.status().is_success() {
-                let content_length = res.headers().get::<header::ContentLength>()
-                    .map(|&header::ContentLength(len)| len);
-                Ok((res.body(), content_length))
-            } else {
-                Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
+        let mut request = Request::new(Method::Get, url2.parse().unwrap());
+        let mut canonical_headers = String::new();
+
+        let token = creds.token().as_ref().map(|s| s.as_str());
+        // Keep the list of header values sorted!
+        for (header, maybe_value) in vec![("x-amz-security-token", token)] {
+            if let Some(ref value) = maybe_value {
+                request.headers_mut().set_raw(
+                    header,
+                    vec![value.as_bytes().to_vec()],
+                );
+                canonical_headers.push_str(
+                    format!("{}:{}\n", header.to_ascii_lowercase(), value).as_ref(),
+                );
             }
-        }).and_then(|(body, content_length)| {
-            body.fold(Vec::new(), |mut body, chunk| {
-                body.extend_from_slice(&chunk);
-                Ok::<_, hyper::Error>(body)
-            }).chain_err(|| {
-                "failed to read HTTP body"
-            }).and_then(move |bytes| {
-                if let Some(len) = content_length {
-                    if len != bytes.len() as u64 {
-                        bail!(format!("Bad HTTP body size read: {}, expected {}", bytes.len(), len));
-                    } else {
-                        info!("Read {} bytes from {}", bytes.len(), url2);
-                    }
-                }
-                Ok(bytes)
-            })
-        }))
+        }
+        let auth = self.auth("GET", &date, key, "", &canonical_headers, "", creds);
+
+        request.headers_mut().set_raw(
+            "Date",
+            vec![date.into_bytes()],
+        );
+        request.headers_mut().set_raw(
+            "Authorization",
+            vec![auth.into_bytes()],
+        );
+
+        Box::new(
+            self.client
+                .request(request)
+                .chain_err(move || format!("failed GET: {}", url))
+                .and_then(|res| if res.status().is_success() {
+                    let content_length = res.headers().get::<header::ContentLength>().map(
+                        |&header::ContentLength(len)| len,
+                    );
+                    Ok((res.body(), content_length))
+                } else {
+                    Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
+                })
+                .and_then(|(body, content_length)| {
+                    body.fold(Vec::new(), |mut body, chunk| {
+                        body.extend_from_slice(&chunk);
+                        Ok::<_, hyper::Error>(body)
+                    }).chain_err(|| "failed to read HTTP body")
+                        .and_then(move |bytes| {
+                            if let Some(len) = content_length {
+                                if len != bytes.len() as u64 {
+                                    bail!(format!(
+                                        "Bad HTTP body size read: {}, expected {}",
+                                        bytes.len(),
+                                        len
+                                    ));
+                                } else {
+                                    info!("Read {} bytes from {}", bytes.len(), url2);
+                                }
+                            }
+                            Ok(bytes)
+                        })
+                }),
+        )
     }
 
     pub fn put(&self, key: &str, content: Vec<u8>, creds: &AwsCredentials)

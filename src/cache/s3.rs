@@ -70,17 +70,22 @@ fn normalize_key(key: &str) -> String {
 
 impl Storage for S3Cache {
     fn get(&self, key: &str) -> SFuture<Cache> {
+        let credentials = self.provider.credentials().chain_err(
+            || "failed to get AWS credentials",
+        );
+
         let key = normalize_key(key);
-        Box::new(self.bucket.get(&key).then(|result| {
-            match result {
-                Ok(data) => {
-                    let hit = CacheRead::from(io::Cursor::new(data))?;
-                    Ok(Cache::Hit(hit))
-                }
-                Err(e) => {
-                    warn!("Got AWS error: {:?}", e);
-                    Ok(Cache::Miss)
-                }
+        let bucket = self.bucket.clone();
+        let response = credentials.and_then(move |credentials| bucket.get(&key, &credentials));
+
+        Box::new(response.then(|result| match result {
+            Ok(data) => {
+                let hit = CacheRead::from(io::Cursor::new(data))?;
+                Ok(Cache::Hit(hit))
+            }
+            Err(e) => {
+                warn!("Got AWS error: {:?}", e);
+                Ok(Cache::Miss)
             }
         }))
     }
